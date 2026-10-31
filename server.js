@@ -1,0 +1,26 @@
+const express=require("express"),http=require("http"),{Server}=require("socket.io"),{Chess}=require("chess.js"),crypto=require("crypto");
+const app=express(),server=http.createServer(app),io=new Server(server),PORT=process.env.PORT||3000;
+app.use(express.static("public"));app.get("/health",(_,res)=>res.json({ok:true}));
+const rooms=new Map(),games=["ludo","chess","checkers","ttt","rps"],colors=["red","blue","green","yellow"];
+const code=()=>crypto.randomBytes(3).toString("hex").toUpperCase(),name=n=>String(n||"Player").replace(/[<>]/g,"").trim().slice(0,18)||"Player";
+const view=r=>({code:r.code,game:r.game,status:r.status,players:r.players.map(x=>({id:x.id,name:x.name,color:x.color})),state:r.state});
+function checkStart(){let b=Array(64).fill(null);for(let r=0;r<3;r++)for(let c=0;c<8;c++)if((r+c)%2)b[r*8+c]="b";for(let r=5;r<8;r++)for(let c=0;c<8;c++)if((r+c)%2)b[r*8+c]="r";return b}
+function state(g){return g==="ttt"?{board:Array(9).fill(""),turn:0,winner:null}:g==="rps"?{choices:{},scores:[0,0],result:"Choose your move!",turn:0,winner:null}:g==="chess"?{fen:new Chess().fen(),turn:0,winner:null}:g==="checkers"?{board:checkStart(),turn:0,winner:null}: {tokens:Array.from({length:4},()=>[-1,-1,-1,-1]),turn:0,dice:null,rolled:false,winner:null,message:"Roll a 6 to leave home."}}
+function emit(r){io.to(r.code).emit("room:update",view(r))}
+function winTTT(b){for(const [a,c,d] of [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]])if(b[a]&&b[a]===b[c]&&b[a]===b[d])return b[a];return b.every(Boolean)?"draw":null}
+function moves(b,i){let p=b[i],r=i>>3,c=i%8,ds=p==="r"?[-1]:[1],out=[];for(let dr of ds)for(let dc of [-1,1]){let y=r+dr,x=c+dc;if(y<0||y>7||x<0||x>7)continue;let j=y*8+x;if(!b[j])out.push({to:j,cap:null});else if(b[j].toLowerCase()!==p.toLowerCase()){let yy=y+dr,xx=x+dc;if(yy>=0&&yy<8&&xx>=0&&xx<8&&!b[yy*8+xx])out.push({to:yy*8+xx,cap:j})}}return out}
+io.on("connection",s=>{
+ s.on("room:create",({game,name:n})=>{if(!games.includes(game))return s.emit("notice","Unknown game.");let r={code:code(),game,max:game==="ludo"?4:2,status:"waiting",players:[{id:s.id,name:name(n),color:colors[0]}],state:null};rooms.set(r.code,r);s.join(r.code);s.emit("room:joined",view(r))});
+ s.on("room:join",({code:c,name:n})=>{let r=rooms.get(String(c||"").toUpperCase());if(!r)return s.emit("notice","Room not found.");if(r.status!=="waiting"||r.players.length>=r.max)return s.emit("notice","Room is full or already started.");r.players.push({id:s.id,name:name(n),color:colors[r.players.length]});s.join(r.code);s.emit("room:joined",view(r));if(r.players.length===r.max){r.status="playing";r.state=state(r.game)}emit(r)});
+ s.on("game:action",a=>{let r=[...rooms.values()].find(x=>x.players.some(p=>p.id===s.id));if(!r||r.status!=="playing")return;let pi=r.players.findIndex(p=>p.id===s.id),v=r.state;if(r.game!=="rps"&&pi!==v.turn)return s.emit("notice","Wait for your turn.");
+ try{
+ if(r.game==="ttt"){let i=+a.index;if(!Number.isInteger(i)||i<0||i>8||v.board[i]||v.winner)return;v.board[i]=pi?"O":"X";v.winner=winTTT(v.board);if(!v.winner)v.turn=1-v.turn}
+ if(r.game==="rps"){if(!["rock","paper","scissors"].includes(a.choice)||v.choices[pi])return;v.choices[pi]=a.choice;if(Object.keys(v.choices).length===2){let x=v.choices[0],y=v.choices[1],w=x===y?-1:((x==="rock"&&y==="scissors")||(x==="paper"&&y==="rock")||(x==="scissors"&&y==="paper")?0:1);if(w>=0)v.scores[w]++;v.result=w<0?"Draw!":r.players[w].name+" wins this round!";v.choices={};v.turn=1-v.turn}else v.result="Move locked. Waiting for opponent…"}
+ if(r.game==="chess"){let ch=new Chess(v.fen),m=ch.move({from:a.from,to:a.to,promotion:"q"});if(!m)return s.emit("notice","Illegal chess move.");v.fen=ch.fen();v.winner=ch.isCheckmate()?pi:ch.isDraw()?"draw":null;if(!v.winner)v.turn=1-v.turn}
+ if(r.game==="checkers"){let f=+a.from,t=+a.to,b=v.board,own=pi?"b":"r";if(!Number.isInteger(f)||!Number.isInteger(t)||f<0||f>63||t<0||t>63)return;if(b[f]&&b[f].toLowerCase()===own){let m=moves(b,f).find(x=>x.to===t);if(!m)return s.emit("notice","Invalid move.");b[t]=b[f];b[f]=null;if(m.cap!==null)b[m.cap]=null;let row=t>>3;if((b[t]==="r"&&row===0)||(b[t]==="b"&&row===7))b[t]=b[t].toUpperCase();if(!b.some(x=>x&&x.toLowerCase()!==own))v.winner=pi;else v.turn=1-pi}}
+ if(r.game==="ludo"){if(a.type==="roll"){if(v.rolled)return;v.dice=1+Math.floor(Math.random()*6);v.rolled=true;let ok=v.tokens[pi].some(x=>x===-1?v.dice===6:x+v.dice<=56);if(!ok){v.rolled=false;v.dice=null;v.turn=(pi+1)%4;v.message="No move possible; turn passed."}}else if(a.type==="move"&&v.rolled){let t=+a.token,pos=v.tokens[pi][t];if(!Number.isInteger(t)||t<0||t>3||pos===undefined|| (pos===-1&&v.dice!==6)||(pos>=0&&pos+v.dice>56))return;v.tokens[pi][t]=pos===-1?0:pos+v.dice;let d=v.dice;v.rolled=false;v.dice=null;if(v.tokens[pi].every(x=>x===56))v.winner=pi;else if(d!==6)v.turn=(pi+1)%4;v.message="Token moved."}}
+ if(v.winner!==null)r.status="finished";emit(r)
+ }catch(e){s.emit("notice","Move rejected.")}});
+ s.on("disconnect",()=>{for(let [k,r] of rooms){let i=r.players.findIndex(p=>p.id===s.id);if(i>=0){r.players.splice(i,1);if(!r.players.length)rooms.delete(k);else{r.status="waiting";r.state=null;emit(r)}}}});
+});
+server.listen(PORT,()=>console.log("GameVerse listening on "+PORT));
